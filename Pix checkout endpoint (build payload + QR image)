@@ -1,0 +1,52 @@
+// src/app/api/pix/checkout/route.ts
+import { NextResponse } from "next/server";
+import QRCode from "qrcode";
+import { db } from "@/lib/db";
+import { decryptString } from "@/lib/crypto";
+import { buildPixPayload, newTxid } from "@/lib/pix";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const parsed = z.object({ giftId: z.string() }).safeParse(body);
+  if (!parsed.success) return NextResponse.json({ error: "giftId obrigatório" }, { status: 400 });
+
+  const gift = await db.gift.findUnique({ where: { id: parsed.data.giftId }, include: { owner: true } });
+  if (!gift || gift.status !== "AVAILABLE") {
+    return NextResponse.json({ error: "Presente indisponível" }, { status: 400 });
+  }
+
+  const owner = gift.owner;
+  if (!owner.pixKeyEnc) return NextResponse.json({ error: "Este perfil não configurou Pix" }, { status: 400 });
+
+  const chave = decryptString(owner.pixKeyEnc);
+  const txid = newTxid();
+
+  const payload = buildPixPayload({
+    chave,
+    valorCents: gift.priceCents,
+    nome: "GENIE BOX",
+    cidade: "BRASIL",
+    txid
+  });
+
+  // Save purchase intent
+  const purchase = await db.purchase.create({
+    data: {
+      giftId: gift.id,
+      amountCents: gift.priceCents,
+      txid,
+      pixPayload: payload
+    }
+  });
+
+  const qrDataUrl = await QRCode.toDataURL(payload, { margin: 1, scale: 8 });
+
+  return NextResponse.json({
+    ok: true,
+    purchaseId: purchase.id,
+    txid,
+    payload,
+    qrDataUrl
+  });
+}
