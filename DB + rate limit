@@ -10,3 +10,17 @@ export const db =
   });
 
 if (process.env.NODE_ENV !== "production") global.prisma = db;
+// src/lib/rateLimit.ts
+const buckets = new Map<string, { count: number; resetAt: number }>();
+
+export function rateLimit(key: string, limit = 10, windowMs = 60_000) {
+  const now = Date.now();
+  const b = buckets.get(key);
+  if (!b || now > b.resetAt) {
+    buckets.set(key, { count: 1, resetAt: now + windowMs });
+    return { ok: true };
+  }
+  b.count++;
+  if (b.count > limit) return { ok: false, retryInMs: b.resetAt - now };
+  return { ok: true };
+}
