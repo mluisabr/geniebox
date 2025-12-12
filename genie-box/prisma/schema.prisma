@@ -1,0 +1,184 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String   @id @default(cuid())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  username          String   @unique
+  email             String   @unique
+  phone             String   @unique
+  passwordHash      String?
+
+  emailVerifiedAt   DateTime?
+  phoneVerifiedAt   DateTime?
+
+  name              String?
+  bio               String?
+  avatarUrl         String?
+  coverUrl          String?
+
+  pixKeyEnc         String?
+  pixKeyType        PixKeyType?
+
+  gifts             Gift[]
+  purchases         Purchase[] @relation("BuyerPurchases")
+  giftsBought       Gift[]     @relation("GiftBuyer")
+  thanksSent        ThankYou[] @relation("BuyerThanks")
+  thanksReceived    ThankYou[] @relation("ReceiverThanks")
+
+  accounts          Account[]
+  sessions          Session[]
+  verificationCodes VerificationCode[]
+
+  @@index([username])
+}
+
+model Gift {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  priceCents  Int
+  currency    String   @default("BRL")
+  url         String?
+  imageUrl    String?
+
+  status      GiftStatus @default(AVAILABLE)
+  boughtAt    DateTime?
+  boughtById  String?
+  boughtBy    User?      @relation("GiftBuyer", fields: [boughtById], references: [id])
+
+  purchases   Purchase[]
+
+  @@index([ownerId, status])
+}
+
+model Purchase {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+
+  giftId       String
+  gift         Gift     @relation(fields: [giftId], references: [id], onDelete: Cascade)
+
+  buyerId      String?
+  buyer        User?    @relation("BuyerPurchases", fields: [buyerId], references: [id])
+
+  amountCents  Int
+  txid         String   @unique
+  pixPayload   String
+  paidAt       DateTime?
+  status       PurchaseStatus @default(PENDING)
+
+  thankYou     ThankYou? @relation("ThankYouPurchase")
+
+  @@index([giftId, status])
+}
+
+model ThankYou {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+
+  purchaseId  String   @unique
+  purchase    Purchase @relation("ThankYouPurchase", fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  buyerId     String?
+  buyer       User?    @relation("BuyerThanks", fields: [buyerId], references: [id])
+
+  receiverId  String
+  receiver    User     @relation("ReceiverThanks", fields: [receiverId], references: [id])
+
+  message     String
+}
+
+model VerificationCode {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime
+  usedAt      DateTime?
+
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind        VerificationKind
+  channel     VerificationChannel
+  codeHash    String
+}
+
+enum GiftStatus {
+  AVAILABLE
+  BOUGHT
+  HIDDEN
+}
+
+enum PurchaseStatus {
+  PENDING
+  PAID
+  CANCELED
+  EXPIRED
+}
+
+enum PixKeyType {
+  PHONE
+  CPF
+  CNPJ
+  EMAIL
+  RANDOM
+}
+
+enum VerificationKind {
+  EMAIL
+  PHONE
+}
+
+enum VerificationChannel {
+  EMAIL
+  SMS
+}
+
+// NextAuth models:
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  user               User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type               String
+  provider           String
+  providerAccountId  String
+  refresh_token      String?
+  access_token       String?
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String?
+  session_state      String?
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expires      DateTime
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}

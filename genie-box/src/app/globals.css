@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+
+html, body {
+  height: 100%;
+  background: #090412;
+}
+
+body {
+  font-feature-settings: "ss01" 1, "cv11" 1;
+}

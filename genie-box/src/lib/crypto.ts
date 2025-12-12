@@ -1,0 +1,50 @@
+import crypto from "crypto";
+import argon2 from "argon2";
+
+const ENC_ALG = "aes-256-gcm";
+
+function getKey(): Buffer {
+  const raw = process.env.ENCRYPTION_KEY;
+  if (!raw || raw.length < 32) throw new Error("ENCRYPTION_KEY missing/too short");
+  const buf = /^[A-Za-z0-9+/=]+$/.test(raw) ? Buffer.from(raw, "base64") : Buffer.from(raw, "utf8");
+  return crypto.createHash("sha256").update(buf).digest();
+}
+
+export async function hashPassword(password: string) {
+  return argon2.hash(password, { type: argon2.argon2id });
+}
+
+export async function verifyPassword(hash: string, password: string) {
+  return argon2.verify(hash, password);
+}
+
+export function encryptString(plain: string): string {
+  const iv = crypto.randomBytes(12);
+  const key = getKey();
+  const cipher = crypto.createCipheriv(ENC_ALG, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]).toString("base64");
+}
+
+export function decryptString(enc: string): string {
+  const data = Buffer.from(enc, "base64");
+  const iv = data.subarray(0, 12);
+  const tag = data.subarray(12, 28);
+  const ciphertext = data.subarray(28);
+  const key = getKey();
+  const decipher = crypto.createDecipheriv(ENC_ALG, key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return plain.toString("utf8");
+}
+
+export function hashCode(code: string) {
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+
+export function randomNumericCode(len = 6) {
+  let out = "";
+  for (let i = 0; i < len; i++) out += Math.floor(Math.random() * 10).toString();
+  return out;
+}
