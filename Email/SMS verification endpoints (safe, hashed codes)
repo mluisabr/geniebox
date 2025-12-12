@@ -1,0 +1,128 @@
+// src/app/api/verify/email/request/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode, randomNumericCode } from "@/lib/crypto";
+import { rateLimit } from "@/lib/rateLimit";
+
+export async function POST(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") ?? "local";
+  const rl = rateLimit(`email:req:${ip}`, 5, 60_000);
+  if (!rl.ok) return NextResponse.json({ error: "Muitas tentativas. Tente novamente." }, { status: 429 });
+
+  const { userId } = await req.json();
+  if (!userId) return NextResponse.json({ error: "userId obrigatório" }, { status: 400 });
+
+  const code = randomNumericCode(6);
+  const expiresAt = new Date(Date.now() + 10 * 60_000);
+
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) return NextResponse.json({ error: "Usuário não encontrado" }, { status: 404 });
+
+  await db.verificationCode.create({
+    data: {
+      userId,
+      kind: "EMAIL",
+      channel: "EMAIL",
+      codeHash: hashCode(code),
+      expiresAt
+    }
+  });
+
+  // TODO: integrate Resend / SMTP
+  // sendEmail(user.email, code)
+
+  return NextResponse.json({ ok: true, devCode: process.env.NODE_ENV === "development" ? code : undefined });
+}
+// src/app/api/verify/email/confirm/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode } from "@/lib/crypto";
+
+export async function POST(req: Request) {
+  const { userId, code } = await req.json();
+  if (!userId || !code) return NextResponse.json({ error: "Dados incompletos" }, { status: 400 });
+
+  const now = new Date();
+  const rec = await db.verificationCode.findFirst({
+    where: {
+      userId,
+      kind: "EMAIL",
+      usedAt: null,
+      expiresAt: { gt: now },
+      codeHash: hashCode(code)
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (!rec) return NextResponse.json({ error: "Código inválido/expirado" }, { status: 400 });
+
+  await db.$transaction([
+    db.verificationCode.update({ where: { id: rec.id }, data: { usedAt: now } }),
+    db.user.update({ where: { id: userId }, data: { emailVerifiedAt: now } })
+  ]);
+
+  return NextResponse.json({ ok: true });
+}
+// src/app/api/verify/phone/request/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode, randomNumericCode } from "@/lib/crypto";
+import { rateLimit } from "@/lib/rateLimit";
+
+export async function POST(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") ?? "local";
+  const rl = rateLimit(`sms:req:${ip}`, 5, 60_000);
+  if (!rl.ok) return NextResponse.json({ error: "Muitas tentativas. Tente novamente." }, { status: 429 });
+
+  const { userId } = await req.json();
+  const user = userId ? await db.user.findUnique({ where: { id: userId } }) : null;
+  if (!user) return NextResponse.json({ error: "Usuário não encontrado" }, { status: 404 });
+
+  const code = randomNumericCode(6);
+  const expiresAt = new Date(Date.now() + 10 * 60_000);
+
+  await db.verificationCode.create({
+    data: {
+      userId,
+      kind: "PHONE",
+      channel: "SMS",
+      codeHash: hashCode(code),
+      expiresAt
+    }
+  });
+
+  // TODO: integrate Twilio / Zenvia / etc
+  // sendSms(user.phone, code)
+
+  return NextResponse.json({ ok: true, devCode: process.env.NODE_ENV === "development" ? code : undefined });
+}
+// src/app/api/verify/phone/confirm/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode } from "@/lib/crypto";
+
+export async function POST(req: Request) {
+  const { userId, code } = await req.json();
+  if (!userId || !code) return NextResponse.json({ error: "Dados incompletos" }, { status: 400 });
+
+  const now = new Date();
+  const rec = await db.verificationCode.findFirst({
+    where: {
+      userId,
+      kind: "PHONE",
+      usedAt: null,
+      expiresAt: { gt: now },
+      codeHash: hashCode(code)
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (!rec) return NextResponse.json({ error: "Código inválido/expirado" }, { status: 400 });
+
+  await db.$transaction([
+    db.verificationCode.update({ where: { id: rec.id }, data: { usedAt: now } }),
+    db.user.update({ where: { id: userId }, data: { phoneVerifiedAt: now } })
+  ]);
+
+  return NextResponse.json({ ok: true });
+}
