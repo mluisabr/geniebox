@@ -1,0 +1,45 @@
+// src/lib/og.ts
+export async function fetchOG(url: string) {
+  const res = await fetch(url, { redirect: "follow", headers: { "user-agent": "GenieBoxBot/1.0" } });
+  const html = await res.text();
+
+  const og = (prop: string) => {
+    const re = new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["'][^>]*>`, "i");
+    return re.exec(html)?.[1];
+  };
+
+  return {
+    title: og("og:title") ?? null,
+    description: og("og:description") ?? null,
+    image: og("og:image") ?? null,
+    site: og("og:site_name") ?? null
+  };
+}
+// src/app/api/og/route.ts
+import { NextResponse } from "next/server";
+import { fetchOG } from "@/lib/og";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const { url } = await req.json();
+  const parsed = z.string().url().safeParse(url);
+  if (!parsed.success) return NextResponse.json({ error: "URL inválida" }, { status: 400 });
+
+  const og = await fetchOG(parsed.data);
+  return NextResponse.json({ ok: true, og });
+}
+// src/lib/ai.ts
+/**
+ * Optional AI hook:
+ * - Given { url, og } produce a cleaned gift suggestion
+ * Replace with your OpenAI call if desired.
+ */
+export async function aiSuggestGift(input: {
+  url: string;
+  og: { title: string | null; description: string | null; image: string | null; site: string | null };
+}) {
+  // Safe default: no AI, just normalize
+  const title = (input.og.title ?? "Presente").slice(0, 120);
+  const description = (input.og.description ?? "").slice(0, 240) || undefined;
+  return { title, description, imageUrl: input.og.image ?? undefined };
+}
