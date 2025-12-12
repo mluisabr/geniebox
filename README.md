@@ -44,3 +44,18 @@ genie-box/
       validators.ts
       ai.ts
   .env.example
+# Genie Box
+
+## Setup
+1) pnpm i (or npm i)
+2) Create Postgres DB and set DATABASE_URL
+3) cp .env.example .env
+4) npx prisma migrate dev
+5) npm run dev
+
+## Notes
+- Email + phone verification are enforced for Credentials sign-in.
+- Pix key is encrypted at rest.
+- Pix payload + QR is generated per purchase with a unique txid.
+- Payment confirmation is MVP-manual; replace with PSP webhook later.
+
