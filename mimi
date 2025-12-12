@@ -1,0 +1,545 @@
+import os, shutil, zipfile, uuid, textwrap, re, json, pathlib, datetime
+
+base = "/mnt/data/genie-box"
+# Ensure base exists from previous run
+assert os.path.exists(base), "Base project missing"
+
+def w(path, content):
+    full = os.path.join(base, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+
+def r(path):
+    with open(os.path.join(base, path), "r", encoding="utf-8") as f:
+        return f.read()
+
+# Update package.json deps
+pkg = json.loads(r("package.json"))
+deps = pkg["dependencies"]
+deps["@aws-sdk/client-s3"] = "^3.600.0"
+deps["@aws-sdk/s3-request-presigner"] = "^3.600.0"
+deps["uuid"] = "^11.0.3"
+pkg["dependencies"] = dict(sorted(deps.items()))
+w("package.json", json.dumps(pkg, indent=2) + "\n")
+
+# Update .env.example
+env = r(".env.example")
+env += """
+# S3-compatible uploads (AWS S3, Cloudflare R2, etc.)
+S3_ENDPOINT=""
+S3_REGION="us-east-1"
+S3_BUCKET=""
+S3_ACCESS_KEY_ID=""
+S3_SECRET_ACCESS_KEY=""
+S3_PUBLIC_BASE_URL=""  # e.g. https://<bucket>.<region>.amazonaws.com or R2 public domain
+
+# Email notifications (Resend)
+RESEND_API_KEY=""
+EMAIL_FROM="Genie Box <no-reply@geniebox.com.br>"
+"""
+w(".env.example", env)
+
+# Prisma: add Notification model + enums
+schema = r("prisma/schema.prisma")
+if "model Notification" not in schema:
+    insert = """
+model Notification {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  readAt    DateTime?
+
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind      NotificationKind
+  title     String
+  body      String
+  url       String?
+
+  @@index([userId, createdAt])
+}
+
+enum NotificationKind { PURCHASED THANKS SYSTEM }
+"""
+    # Insert before NextAuth models comment (best spot)
+    schema = schema.replace("// NextAuth models:", insert + "\n// NextAuth models:")
+    # Add relation field to User
+    schema = schema.replace("verificationCodes VerificationCode[]\n", "verificationCodes VerificationCode[]\n  notifications     Notification[]\n")
+    w("prisma/schema.prisma", schema)
+
+# Add lib/email.ts (Resend)
+w("src/lib/email.ts", """type SendEmailArgs = {
+  to: string;
+  subject: string;
+  html: string;
+};
+
+export async function sendEmail({ to, subject, html }: SendEmailArgs) {
+  const key = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM;
+
+  if (!key || !from) {
+    // In dev, silently skip if not configured
+    if (process.env.NODE_ENV !== "production") {
+      console.log("[email] skipped (missing RESEND_API_KEY/EMAIL_FROM)", { to, subject });
+      return { ok: true, skipped: true as const };
+    }
+    throw new Error("Email provider not configured");
+  }
+
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${key}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ from, to, subject, html })
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error("[email] failed", res.status, text);
+    if (process.env.NODE_ENV === "production") throw new Error("Failed to send email");
+  }
+
+  return { ok: true };
+}
+""")
+
+# Add lib/s3.ts for presigned uploads
+w("src/lib/s3.ts", """import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import crypto from "crypto";
+
+function must(v: string | undefined, name: string) {
+  if (!v) throw new Error(`${name} missing`);
+  return v;
+}
+
+export function getS3Client() {
+  const endpoint = process.env.S3_ENDPOINT || undefined;
+  const region = process.env.S3_REGION || "us-east-1";
+
+  return new S3Client({
+    region,
+    endpoint,
+    forcePathStyle: Boolean(endpoint), // typical for R2/minio
+    credentials: {
+      accessKeyId: must(process.env.S3_ACCESS_KEY_ID, "S3_ACCESS_KEY_ID"),
+      secretAccessKey: must(process.env.S3_SECRET_ACCESS_KEY, "S3_SECRET_ACCESS_KEY")
+    }
+  });
+}
+
+export function makeUploadKey(userId: string, ext: string) {
+  const id = crypto.randomBytes(12).toString("hex");
+  const safeExt = ext.replace(/[^a-z0-9]/gi, "").slice(0, 10) || "bin";
+  return `uploads/${userId}/${id}.${safeExt}`;
+}
+
+export async function presignPutObject(args: {
+  bucket: string;
+  key: string;
+  contentType: string;
+  expiresInSec?: number;
+}) {
+  const s3 = getS3Client();
+  const cmd = new PutObjectCommand({
+    Bucket: args.bucket,
+    Key: args.key,
+    ContentType: args.contentType,
+    ACL: "public-read"
+  });
+
+  const url = await getSignedUrl(s3, cmd, { expiresIn: args.expiresInSec ?? 60 });
+  return url;
+}
+
+export function publicUrlForKey(key: string) {
+  const base = process.env.S3_PUBLIC_BASE_URL;
+  if (!base) return null;
+  return `${base.replace(/\\/$/, "")}/${key}`;
+}
+""")
+
+# Add uploads presign endpoint
+w("src/app/api/uploads/presign/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { z } from "zod";
+import { makeUploadKey, presignPutObject, publicUrlForKey } from "@/lib/s3";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const body = await req.json();
+  const parsed = z.object({
+    filename: z.string().min(1).max(200),
+    contentType: z.string().min(3).max(100)
+  }).safeParse(body);
+
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const user = await db.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  const bucket = process.env.S3_BUCKET;
+  if (!bucket) return NextResponse.json({ ok: false, error: "S3_BUCKET não configurado" }, { status: 500 });
+
+  const ext = parsed.data.filename.split(".").pop() ?? "bin";
+  const key = makeUploadKey(user.id, ext);
+
+  const uploadUrl = await presignPutObject({
+    bucket,
+    key,
+    contentType: parsed.data.contentType
+  });
+
+  const publicUrl = publicUrlForKey(key);
+  if (!publicUrl) return NextResponse.json({ ok: false, error: "S3_PUBLIC_BASE_URL não configurado" }, { status: 500 });
+
+  return NextResponse.json({ ok: true, uploadUrl, publicUrl, key });
+}
+""")
+
+# Add notifications endpoints
+w("src/app/api/notifications/list/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+
+export async function GET() {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const user = await db.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  const items = await db.notification.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: "desc" },
+    take: 50
+  });
+
+  return NextResponse.json({ ok: true, items });
+}
+""")
+
+w("src/app/api/notifications/read/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const { id } = await req.json();
+  const parsed = z.string().min(3).safeParse(id);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "id inválido" }, { status: 400 });
+
+  const user = await db.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  await db.notification.updateMany({
+    where: { id: parsed.data, userId: user.id },
+    data: { readAt: new Date() }
+  });
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+# Payment confirmation: PSP webhook + polling endpoint
+w("src/app/api/psp/webhook/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { z } from "zod";
+import { sendEmail } from "@/lib/email";
+
+/**
+ * Generic PSP webhook.
+ * You should verify signature from your PSP here (not implemented in starter).
+ *
+ * Expected body:
+ * { txid: string, status: "PAID" | "CANCELED" | "EXPIRED", paidAt?: string }
+ */
+export async function POST(req: Request) {
+  const body = await req.json();
+
+  const parsed = z.object({
+    txid: z.string().min(6),
+    status: z.enum(["PAID", "CANCELED", "EXPIRED"]),
+    paidAt: z.string().optional()
+  }).safeParse(body);
+
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const purchase = await db.purchase.findUnique({
+    where: { txid: parsed.data.txid },
+    include: { gift: { include: { owner: true } } }
+  });
+
+  if (!purchase) return NextResponse.json({ ok: false, error: "txid não encontrado" }, { status: 404 });
+
+  // Idempotent updates
+  if (parsed.data.status === "PAID" && purchase.status !== "PAID") {
+    const paidAt = parsed.data.paidAt ? new Date(parsed.data.paidAt) : new Date();
+
+    await db.$transaction(async (tx) => {
+      await tx.purchase.update({ where: { id: purchase.id }, data: { status: "PAID", paidAt } });
+      await tx.gift.update({ where: { id: purchase.giftId }, data: { status: "BOUGHT", boughtAt: paidAt } });
+
+      await tx.notification.create({
+        data: {
+          userId: purchase.gift.ownerId,
+          kind: "PURCHASED",
+          title: "Você recebeu um presente 🎁",
+          body: `Alguém acabou de pagar o Pix de: ${purchase.gift.title}`,
+          url: `/app`
+        }
+      });
+    });
+
+    // Email notify receiver
+    await sendEmail({
+      to: purchase.gift.owner.email,
+      subject: "Genie Box — Você recebeu um presente 🎁",
+      html: `<p>Boas notícias! Um Pix foi confirmado para o presente <b>${purchase.gift.title}</b>.</p>
+             <p>Abra seu painel para ver detalhes.</p>`
+    }).catch(() => {});
+  }
+
+  if (parsed.data.status !== "PAID" && purchase.status === "PENDING") {
+    await db.purchase.update({ where: { id: purchase.id }, data: { status: parsed.data.status } });
+  }
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+w("src/app/api/purchases/status/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const parsed = z.object({ purchaseId: z.string().min(3) }).safeParse(await req.json());
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const purchase = await db.purchase.findUnique({ where: { id: parsed.data.purchaseId } });
+  if (!purchase) return NextResponse.json({ ok: false, error: "Compra não encontrada" }, { status: 404 });
+
+  return NextResponse.json({ ok: true, status: purchase.status, paidAt: purchase.paidAt });
+}
+""")
+
+# Update gifts/buy to create notification + send email (manual confirm)
+buy_route = r("src/app/api/gifts/buy/route.ts")
+if "sendEmail" not in buy_route:
+    buy_route = buy_route.replace('import { db } from "@/lib/db";', 'import { db } from "@/lib/db";\nimport { sendEmail } from "@/lib/email";')
+    buy_route = buy_route.replace("await db.$transaction([", "await db.$transaction([\n    db.notification.create({\n      data: {\n        userId: purchase.gift.ownerId,\n        kind: \"PURCHASED\",\n        title: \"Você recebeu um presente 🎁\",\n        body: `Alguém confirmou o pagamento do Pix de: ${purchase.gift.title}`,\n        url: \"/app\"\n      }\n    }),\n")
+    # add email after transaction (before return)
+    buy_route = buy_route.replace("  return NextResponse.json({ ok: true });",
+                                  "  // Email notify receiver (optional)\n  const owner = await db.user.findUnique({ where: { id: purchase.gift.ownerId } });\n  if (owner) {\n    await sendEmail({\n      to: owner.email,\n      subject: \"Genie Box — Você recebeu um presente 🎁\",\n      html: `<p>Um Pix foi confirmado para o presente <b>${purchase.gift.title}</b>.</p><p>Abra seu painel para ver detalhes.</p>`\n    }).catch(() => {});\n  }\n\n  return NextResponse.json({ ok: true });")
+    w("src/app/api/gifts/buy/route.ts", buy_route)
+
+# Add dashboard notifications UI + file uploads
+dash = r("src/app/app/ui.tsx")
+# Replace avatar/cover url inputs with upload + url
+if "presign" not in dash:
+    # inject helper upload function near top
+    dash = dash.replace('import { useMemo, useState } from "react";',
+                        'import { useEffect, useMemo, useState } from "react";')
+    insert_helper = """
+async function uploadFile(file: File) {
+  const presign = await fetch("/api/uploads/presign", {
+    method: "POST",
+    body: JSON.stringify({ filename: file.name, contentType: file.type || "application/octet-stream" })
+  }).then(r => r.json());
+
+  if (!presign.ok) throw new Error(presign.error ?? "Falha ao preparar upload.");
+
+  const put = await fetch(presign.uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+    body: file
+  });
+
+  if (!put.ok) throw new Error("Falha ao enviar arquivo.");
+  return presign.publicUrl as string;
+}
+"""
+    dash = dash.replace("function toCents", insert_helper + "\nfunction toCents")
+    # add notifications state and load
+    dash = dash.replace("export default function DashboardClient({ user }: { user: any }) {",
+                        """export default function DashboardClient({ user }: { user: any }) {""")
+    # insert notifications hook after state declarations
+    marker = "const [savingPix, setSavingPix] = useState(false);\n"
+    if marker in dash:
+        dash = dash.replace(marker, marker + """
+  const [notifications, setNotifications] = useState<any[]>([]);
+  useEffect(() => {
+    fetch("/api/notifications/list").then(r => r.json()).then(j => {
+      if (j.ok) setNotifications(j.items);
+    }).catch(() => {});
+  }, []);
+""")
+    # Replace avatarUrl input block with file input
+    dash = dash.replace(
+        '<input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"\n                placeholder="avatarUrl (cole um link)"\n                value={avatarUrl}\n                onChange={(e) => setAvatarUrl(e.target.value)}\n              />',
+        """<div className="grid gap-2">
+              <label className="text-xs text-white/60">Foto de perfil</label>
+              <input
+                className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="avatarUrl (ou faça upload abaixo)"
+                value={avatarUrl}
+                onChange={(e) => setAvatarUrl(e.target.value)}
+              />
+              <input
+                type="file"
+                accept="image/*"
+                className="text-xs text-white/70"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  const url = await uploadFile(f);
+                  setAvatarUrl(url);
+                }}
+              />
+            </div>"""
+    )
+    dash = dash.replace(
+        '<input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"\n                placeholder="coverUrl (cole um link)"\n                value={coverUrl}\n                onChange={(e) => setCoverUrl(e.target.value)}\n              />',
+        """<div className="grid gap-2">
+              <label className="text-xs text-white/60">Capa / banner</label>
+              <input
+                className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="coverUrl (ou faça upload abaixo)"
+                value={coverUrl}
+                onChange={(e) => setCoverUrl(e.target.value)}
+              />
+              <input
+                type="file"
+                accept="image/*"
+                className="text-xs text-white/70"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  const url = await uploadFile(f);
+                  setCoverUrl(url);
+                }}
+              />
+            </div>"""
+    )
+    # Add gift image file upload under imageUrl input
+    dash = dash.replace(
+        '<input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="imagem (url)" value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} />',
+        """<div className="grid gap-2">
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="imagem (url) ou upload" value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} />
+              <input
+                type="file"
+                accept="image/*"
+                className="text-xs text-white/70"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  if (!f) return;
+                  const url = await uploadFile(f);
+                  setImageUrl(url);
+                }}
+              />
+            </div>"""
+    )
+    # Add notifications panel before "Seus presentes" section (insert after gifts creation sections)
+    insert_point = '        <section className="mt-6 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">\n          <h2 className="text-lg font-semibold">Seus presentes</h2>\n'
+    if insert_point in dash:
+        notif_panel = """
+        <section className="mt-6 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+          <h2 className="text-lg font-semibold">Notificações</h2>
+          <div className="mt-4 grid gap-3">
+            {notifications.length === 0 ? (
+              <p className="text-sm text-white/70">Nada por aqui ainda.</p>
+            ) : (
+              notifications.map((n) => (
+                <button
+                  key={n.id}
+                  className="text-left rounded-2xl border border-white/10 bg-white/5 p-4 hover:bg-white/10"
+                  onClick={async () => {
+                    await fetch("/api/notifications/read", { method: "POST", body: JSON.stringify({ id: n.id }) });
+                    if (n.url) location.href = n.url;
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold">{n.title}</p>
+                      <p className="mt-1 text-xs text-white/70">{n.body}</p>
+                    </div>
+                    <span className="text-xs text-white/50">{n.readAt ? "lida" : "nova"}</span>
+                  </div>
+                </button>
+              ))
+            )}
+          </div>
+        </section>
+
+"""
+        dash = dash.replace(insert_point, notif_panel + insert_point)
+    w("src/app/app/ui.tsx", dash)
+
+# Update PixCheckoutModal to poll purchase status every 2s after open
+pcm = r("src/components/PixCheckoutModal.tsx")
+if "purchases/status" not in pcm:
+    pcm = pcm.replace('import { useState } from "react";', 'import { useEffect, useState } from "react";')
+    # add polling effect inside component after state
+    pcm = pcm.replace('const [err, setErr] = useState<string | null>(null);',
+                      'const [err, setErr] = useState<string | null>(null);\n  const [paid, setPaid] = useState(false);\n\n  useEffect(() => {\n    if (!open || !data?.purchaseId) return;\n    let alive = true;\n    const t = setInterval(async () => {\n      const r = await fetch("/api/purchases/status", { method: "POST", body: JSON.stringify({ purchaseId: data.purchaseId }) });\n      const j = await r.json();\n      if (alive && j.ok && j.status === "PAID") {\n        setPaid(true);\n        clearInterval(t);\n        setTimeout(() => location.reload(), 800);\n      }\n    }, 2000);\n    return () => { alive = false; clearInterval(t); };\n  }, [open, data?.purchaseId]);')
+    # show paid message
+    pcm = pcm.replace('{data && (', '{data && (\n              <>')
+    pcm = pcm.replace('</div>\n            )}', '</div>\n                {paid ? <p className="text-sm text-emerald-200">Pagamento confirmado ✅</p> : <p className="text-xs text-white/50">Aguardando confirmação…</p>}\n              </>\n            )}')
+    w("src/components/PixCheckoutModal.tsx", pcm)
+
+# Update PublicProfile header to use coverUrl
+pub = r("src/app/u/[username]/page.tsx")
+pub = pub.replace('<div className="h-40 w-full bg-[linear-gradient(135deg,rgba(200,140,255,0.16),rgba(255,255,255,0.02))]" />',
+                  '{user.coverUrl ? (\n            <img src={user.coverUrl} alt="" className="h-40 w-full object-cover" />\n          ) : (\n            <div className="h-40 w-full bg-[linear-gradient(135deg,rgba(200,140,255,0.16),rgba(255,255,255,0.02))]" />\n          )}')
+w("src/app/u/[username]/page.tsx", pub)
+
+# Ensure GiftCard shows image if provided
+gc = r("src/components/GiftCard.tsx")
+if "gift.imageUrl" not in gc:
+    gc = gc.replace('return (\n    <div', 'return (\n    <div')
+    gc = gc.replace('<div className="flex items-start justify-between gap-4">', '{gift.imageUrl ? (\n        <img src={gift.imageUrl} alt="" className="mb-4 h-44 w-full rounded-2xl object-cover ring-1 ring-white/10" />\n      ) : null}\n\n      <div className="flex items-start justify-between gap-4">')
+    w("src/components/GiftCard.tsx", gc)
+
+# Update README with new features
+readme = r("README.md")
+if "uploads" not in readme.lower():
+    readme += """
+## Added extras
+- Email notifications (Resend)
+- In-app notifications panel
+- Purchase status polling endpoint + generic PSP webhook
+- Image uploads via S3-compatible storage (AWS S3 / Cloudflare R2)
+
+### Payment confirmation
+- MVP manual confirm still exists.
+- For real payments, configure your PSP to call `/api/psp/webhook` with `{ txid, status }`.
+"""
+w("README.md", readme)
+
+# Create new zip
+zip_path2 = "/mnt/data/genie-box-v2.zip"
+if os.path.exists(zip_path2):
+    os.remove(zip_path2)
+
+with zipfile.ZipFile(zip_path2, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk(base):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            arc = os.path.relpath(fp, base)
+            zf.write(fp, arc)
+
+zip_path2
+
