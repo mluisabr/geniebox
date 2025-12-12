@@ -1,0 +1,1951 @@
+import os, textwrap, json, zipfile, pathlib, shutil, re, random, string, datetime
+
+base = "/mnt/data/genie-box"
+if os.path.exists(base):
+    shutil.rmtree(base)
+os.makedirs(base, exist_ok=True)
+
+def w(path, content):
+    full = os.path.join(base, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+
+# Root configs
+w("package.json", """{
+  "name": "genie-box",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0",
+    "argon2": "^0.41.1",
+    "next": "^15.0.0",
+    "next-auth": "^4.24.11",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.0.0",
+    "postcss": "^8.4.49",
+    "prisma": "^6.0.0",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.6.3"
+  }
+}
+""")
+
+w("next.config.mjs", """/** @type {import('next').NextConfig} */
+const nextConfig = {
+  images: { remotePatterns: [{ protocol: "https", hostname: "**" }] }
+};
+export default nextConfig;
+""")
+
+w("tsconfig.json", """{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}
+""")
+
+w("postcss.config.mjs", """export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+""")
+
+w("tailwind.config.ts", """import type { Config } from "tailwindcss";
+
+export default {
+  content: [
+    "./src/app/**/*.{ts,tsx}",
+    "./src/components/**/*.{ts,tsx}",
+  ],
+  theme: {
+    extend: {}
+  },
+  plugins: [],
+} satisfies Config;
+""")
+
+w(".env.example", """DATABASE_URL="postgresql://USER:PASSWORD@localhost:5432/geniebox"
+
+NEXTAUTH_SECRET="replace-me"
+NEXTAUTH_URL="http://localhost:3000"
+
+ENCRYPTION_KEY="use-a-strong-random-base64-32bytes-min"
+
+GOOGLE_CLIENT_ID=""
+GOOGLE_CLIENT_SECRET=""
+
+APPLE_CLIENT_ID=""
+APPLE_CLIENT_SECRET=""
+
+RESEND_API_KEY=""
+TWILIO_ACCOUNT_SID=""
+TWILIO_AUTH_TOKEN=""
+TWILIO_FROM_NUMBER=""
+""")
+
+w("README.md", """# Genie Box 🇧🇷✨
+
+Starter repo for a WishTender-like wishlist/sponsoring website focused on Brazil + Pix.
+
+## Tech
+- Next.js (App Router) + TypeScript + Tailwind
+- Prisma + Postgres
+- NextAuth (Credentials + Google + Apple)
+- Argon2id passwords + encrypted Pix key at rest
+- Email + phone verification (code-based)
+
+## Quickstart
+1) `cp .env.example .env` and fill env vars
+2) Create a Postgres DB and set `DATABASE_URL`
+3) `npm i`
+4) `npx prisma migrate dev`
+5) `npm run dev`
+
+## MVP notes
+- Pix checkout generates a unique txid each time and renders a QR + “copia e cola”.
+- Payment confirmation is **manual** via button (replace with PSP/webhook later).
+- OAuth users must complete onboarding (set username + phone + verify phone).
+
+## Routes
+- `/` landing
+- `/cadastrar` register + onboarding starter
+- `/verificar` verify email + phone
+- `/app` dashboard (profile + Pix + gifts)
+- `/u/[username]` public profile/wishlist
+""")
+
+# Prisma schema
+w("prisma/schema.prisma", """generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+
+model User {
+  id                String   @id @default(cuid())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  username          String   @unique
+  email             String   @unique
+  phone             String   @unique
+  passwordHash      String?
+
+  emailVerifiedAt   DateTime?
+  phoneVerifiedAt   DateTime?
+
+  name              String?
+  bio               String?
+  avatarUrl         String?
+  coverUrl          String?
+
+  pixKeyEnc         String?
+  pixKeyType        PixKeyType?
+
+  gifts             Gift[]
+  purchases         Purchase[] @relation("BuyerPurchases")
+  thanksSent        ThankYou[] @relation("BuyerThanks")
+  thanksReceived    ThankYou[] @relation("ReceiverThanks")
+
+  accounts          Account[]
+  sessions          Session[]
+  verificationCodes VerificationCode[]
+
+  @@index([username])
+}
+
+model Gift {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  priceCents  Int
+  currency    String   @default("BRL")
+  url         String?
+  imageUrl    String?
+
+  status      GiftStatus @default(AVAILABLE)
+  boughtAt    DateTime?
+  boughtById  String?
+  boughtBy    User?      @relation("BuyerPurchases", fields: [boughtById], references: [id])
+
+  purchases   Purchase[]
+
+  @@index([ownerId, status])
+}
+
+model Purchase {
+  id           String   @id @default(cuid())
+  createdAt    DateTime @default(now())
+
+  giftId       String
+  gift         Gift     @relation(fields: [giftId], references: [id], onDelete: Cascade)
+
+  buyerId      String?
+  buyer        User?    @relation("BuyerPurchases", fields: [buyerId], references: [id])
+
+  amountCents  Int
+  txid         String   @unique
+  pixPayload   String
+  paidAt       DateTime?
+  status       PurchaseStatus @default(PENDING)
+
+  @@index([giftId, status])
+}
+
+model ThankYou {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+
+  purchaseId  String   @unique
+  purchase    Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  buyerId     String?
+  buyer       User?    @relation("BuyerThanks", fields: [buyerId], references: [id])
+
+  receiverId  String
+  receiver    User     @relation("ReceiverThanks", fields: [receiverId], references: [id])
+
+  message     String
+}
+
+model VerificationCode {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime
+  usedAt      DateTime?
+
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind        VerificationKind
+  channel     VerificationChannel
+  codeHash    String
+}
+
+enum GiftStatus { AVAILABLE BOUGHT HIDDEN }
+enum PurchaseStatus { PENDING PAID CANCELED EXPIRED }
+enum PixKeyType { PHONE CPF CNPJ EMAIL RANDOM }
+enum VerificationKind { EMAIL PHONE }
+enum VerificationChannel { EMAIL SMS }
+
+// NextAuth models:
+model Account {
+  id                 String  @id @default(cuid())
+  userId             String
+  user               User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type               String
+  provider           String
+  providerAccountId  String
+  refresh_token      String?
+  access_token       String?
+  expires_at         Int?
+  token_type         String?
+  scope              String?
+  id_token           String?
+  session_state      String?
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expires      DateTime
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+  @@unique([identifier, token])
+}
+""")
+
+# App layout + globals
+w("src/app/layout.tsx", """import "./globals.css";
+import { ReactNode } from "react";
+import Providers from "./providers";
+
+export const metadata = {
+  title: "Genie Box",
+  description: "Wishlists com Pix — o jeito elegante de presentear no Brasil."
+};
+
+export default function RootLayout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="pt-BR">
+      <body>
+        <Providers>{children}</Providers>
+      </body>
+    </html>
+  );
+}
+""")
+
+w("src/app/providers.tsx", """"use client";
+
+import { SessionProvider } from "next-auth/react";
+import { ReactNode } from "react";
+
+export default function Providers({ children }: { children: ReactNode }) {
+  return <SessionProvider>{children}</SessionProvider>;
+}
+""")
+
+w("src/app/globals.css", """@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; }
+
+html, body {
+  height: 100%;
+  background: #090412;
+}
+
+body {
+  font-feature-settings: "ss01" 1, "cv11" 1;
+}
+""")
+
+# Components
+w("src/components/NoiseOverlay.tsx", """export default function NoiseOverlay() {
+  return (
+    <div
+      aria-hidden
+      className="pointer-events-none absolute inset-0 opacity-[0.12] mix-blend-overlay"
+      style={{
+        backgroundImage:
+          "url(\\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E\\")"
+      }}
+    />
+  );
+}
+""")
+
+w("src/components/GenieBoxHero.tsx", """import NoiseOverlay from "./NoiseOverlay";
+import Link from "next/link";
+
+export default function GenieBoxHero() {
+  return (
+    <section className="relative overflow-hidden">
+      <div className="absolute inset-0 bg-[radial-gradient(1200px_circle_at_50%_15%,rgba(200,140,255,0.25),transparent_55%),radial-gradient(900px_circle_at_50%_110%,rgba(140,80,255,0.22),transparent_60%)]" />
+      <div className="absolute inset-0 bg-[linear-gradient(to_bottom,rgba(15,8,26,0.2),rgba(10,4,18,0.9))]" />
+      <NoiseOverlay />
+
+      <div className="relative mx-auto flex min-h-[88dvh] max-w-6xl flex-col items-center justify-center px-6 text-center">
+        <div className="relative mb-10">
+          <div className="h-48 w-48 rounded-[38px] bg-[linear-gradient(145deg,rgba(255,255,255,0.06),rgba(255,255,255,0.01))] shadow-[0_30px_80px_rgba(0,0,0,0.55)]" />
+          <div className="pointer-events-none absolute inset-0 rounded-[38px] ring-1 ring-white/10" />
+          <div className="pointer-events-none absolute inset-0 rounded-[38px] shadow-[inset_0_0_0_2px_rgba(255,255,255,0.06)]" />
+          <div className="pointer-events-none absolute -inset-1 rounded-[42px] bg-[radial-gradient(120px_circle_at_35%_25%,rgba(255,255,255,0.18),transparent_55%)] blur-[2px]" />
+          <div className="pointer-events-none absolute inset-[10px] rounded-[28px] bg-[linear-gradient(180deg,rgba(0,0,0,0.10),rgba(0,0,0,0.35))]" />
+          <div className="pointer-events-none absolute inset-[10px] rounded-[28px] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.07)]" />
+        </div>
+
+        <p className="text-sm tracking-wide text-white/70">O site mais esperado chegou no momento perfeito.</p>
+        <p className="mt-2 text-sm tracking-wide text-white/70">Suas preces foram ouvidas</p>
+
+        <h1 className="mt-6 max-w-3xl text-balance text-3xl font-semibold leading-tight text-white md:text-5xl">
+          Faça muito mais do que três pedidos para os gênios da lâmpada da internet
+        </h1>
+
+        <p className="mt-4 max-w-2xl text-pretty text-base text-white/70 md:text-lg">
+          Genie Box é seu perfil compartilhável de desejos — e o jeito mais simples de pessoas te presentearem via Pix.
+        </p>
+
+        <div className="mt-10 flex flex-col gap-3 sm:flex-row">
+          <Link
+            href="/cadastrar"
+            className="rounded-2xl bg-white/10 px-6 py-3 text-sm font-semibold text-white shadow-[0_10px_30px_rgba(0,0,0,0.35)] ring-1 ring-white/15 backdrop-blur transition hover:bg-white/15"
+          >
+            Crie a sua lista AGORA e veja!
+          </Link>
+          <Link
+            href="/entrar"
+            className="rounded-2xl border border-white/15 bg-transparent px-6 py-3 text-sm font-semibold text-white/90 transition hover:bg-white/5"
+          >
+            Entrar
+          </Link>
+        </div>
+
+        <div className="mt-14 h-px w-full max-w-2xl bg-gradient-to-r from-transparent via-white/15 to-transparent" />
+      </div>
+    </section>
+  );
+}
+""")
+
+w("src/components/GiftCard.tsx", """import PixCheckoutModal from "./PixCheckoutModal";
+
+export default function GiftCard({ gift }: { gift: any }) {
+  const brl = (gift.priceCents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+  return (
+    <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-base font-semibold">{gift.title}</h3>
+          <p className="mt-1 text-sm text-white/70">{brl}</p>
+        </div>
+
+        {gift.status === "BOUGHT" ? (
+          <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white/70 ring-1 ring-white/10">
+            comprado
+          </span>
+        ) : (
+          <PixCheckoutModal giftId={gift.id} />
+        )}
+      </div>
+
+      {gift.description && <p className="mt-3 text-sm text-white/70">{gift.description}</p>}
+      {gift.url && (
+        <a className="mt-3 inline-block text-sm text-white/80 underline decoration-white/20" href={gift.url} target="_blank">
+          ver link
+        </a>
+      )}
+    </div>
+  );
+}
+""")
+
+w("src/components/PixCheckoutModal.tsx", """"use client";
+
+import { useState } from "react";
+
+export default function PixCheckoutModal({ giftId }: { giftId: string }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState<any>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function start() {
+    setLoading(true);
+    setErr(null);
+    const res = await fetch("/api/pix/checkout", { method: "POST", body: JSON.stringify({ giftId }) });
+    const json = await res.json();
+    if (!json.ok) setErr(json.error ?? "Erro ao gerar Pix.");
+    setData(json.ok ? json : null);
+    setLoading(false);
+  }
+
+  return (
+    <>
+      <button
+        className="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+        onClick={() => {
+          setOpen(true);
+          start();
+        }}
+      >
+        presentear
+      </button>
+
+      {open && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-6">
+          <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-[#0b0417] p-6 text-white shadow-[0_30px_100px_rgba(0,0,0,0.6)]">
+            <div className="flex items-center justify-between">
+              <h4 className="text-lg font-semibold">Pagar com Pix</h4>
+              <button className="text-white/70 hover:text-white" onClick={() => setOpen(false)}>✕</button>
+            </div>
+
+            {loading && <p className="mt-4 text-sm text-white/70">Gerando QR…</p>}
+            {err && <p className="mt-4 text-sm text-rose-200">{err}</p>}
+
+            {data && (
+              <div className="mt-5 grid gap-4">
+                <img src={data.qrDataUrl} alt="QR Pix" className="mx-auto w-56 rounded-2xl bg-white p-2" />
+                <textarea
+                  className="h-28 w-full resize-none rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-white/80"
+                  value={data.payload}
+                  readOnly
+                />
+                <button
+                  className="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                  onClick={async () => {
+                    await navigator.clipboard.writeText(data.payload);
+                  }}
+                >
+                  copiar Pix
+                </button>
+
+                <button
+                  className="rounded-2xl border border-white/15 bg-transparent px-4 py-2 text-sm font-semibold text-white/90 hover:bg-white/5"
+                  onClick={async () => {
+                    await fetch("/api/gifts/buy", { method: "POST", body: JSON.stringify({ purchaseId: data.purchaseId }) });
+                    location.reload();
+                  }}
+                >
+                  já paguei (confirmar)
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+""")
+
+# Landing page
+w("src/app/page.tsx", """import GenieBoxHero from "@/components/GenieBoxHero";
+
+export default function HomePage() {
+  return (
+    <main className="min-h-dvh">
+      <GenieBoxHero />
+      <section className="mx-auto max-w-5xl px-6 pb-20">
+        <div className="grid gap-6 md:grid-cols-3">
+          <div className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h3 className="text-lg font-semibold">Pix do jeitinho certo</h3>
+            <p className="mt-2 text-sm text-white/70">
+              Cada presente gera um Pix “copia e cola” + QR com referência única (txid).
+            </p>
+          </div>
+          <div className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h3 className="text-lg font-semibold">Perfil público e linkável</h3>
+            <p className="mt-2 text-sm text-white/70">
+              Compartilhe seu link em qualquer rede: /u/seuusername.
+            </p>
+          </div>
+          <div className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h3 className="text-lg font-semibold">Seguro por padrão</h3>
+            <p className="mt-2 text-sm text-white/70">
+              Senhas com Argon2id, Pix criptografado, verificação de email e telefone.
+            </p>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+""")
+
+# Public profile route
+w("src/app/u/[username]/page.tsx", """import { db } from "@/lib/db";
+import GiftCard from "@/components/GiftCard";
+
+export default async function PublicProfile({ params }: { params: { username: string } }) {
+  const user = await db.user.findUnique({
+    where: { username: params.username },
+    include: { gifts: { where: { status: { in: ["AVAILABLE", "BOUGHT"] } }, orderBy: { createdAt: "desc" } } }
+  });
+
+  if (!user) return <div className="p-10 text-white/80">Perfil não encontrado.</div>;
+
+  return (
+    <main className="min-h-dvh bg-[radial-gradient(800px_circle_at_50%_-10%,rgba(170,90,255,0.25),transparent_55%)] text-white">
+      <header className="mx-auto max-w-4xl px-6 pt-10">
+        <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-white/5">
+          <div className="h-40 w-full bg-[linear-gradient(135deg,rgba(200,140,255,0.16),rgba(255,255,255,0.02))]" />
+          <div className="-mt-10 flex items-end gap-4 px-6 pb-6">
+            <div className="h-20 w-20 overflow-hidden rounded-2xl bg-white/10 ring-1 ring-white/15">
+              {user.avatarUrl ? <img src={user.avatarUrl} alt="" className="h-full w-full object-cover" /> : null}
+            </div>
+            <div className="pb-1">
+              <h1 className="text-2xl font-semibold">@{user.username}</h1>
+              {user.bio && <p className="mt-1 text-sm text-white/70">{user.bio}</p>}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section className="mx-auto max-w-4xl px-6 py-10">
+        <h2 className="text-lg font-semibold">Lista de desejos</h2>
+        <div className="mt-5 grid gap-4 md:grid-cols-2">
+          {user.gifts.map((g) => (
+            <GiftCard key={g.id} gift={g} />
+          ))}
+        </div>
+      </section>
+    </main>
+  );
+}
+""")
+
+# Auth pages (UI)
+w("src/app/(auth)/entrar/page.tsx", """"use client";
+
+import { signIn } from "next-auth/react";
+import { useState } from "react";
+
+export default function Entrar() {
+  const [login, setLogin] = useState("");
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+
+  return (
+    <main className="min-h-dvh grid place-items-center px-6 text-white">
+      <div className="w-full max-w-md rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+        <h1 className="text-2xl font-semibold">Entrar</h1>
+        <p className="mt-2 text-sm text-white/70">Use email, telefone ou @username.</p>
+
+        <div className="mt-6 grid gap-3">
+          <input
+            className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-white/10"
+            placeholder="email, telefone ou username"
+            value={login}
+            onChange={(e) => setLogin(e.target.value)}
+          />
+          <input
+            className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-white/10"
+            placeholder="senha"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+
+          {err && <p className="text-sm text-rose-200">{err}</p>}
+
+          <button
+            className="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+            onClick={async () => {
+              setErr(null);
+              const res = await signIn("credentials", { login, password, redirect: false });
+              if (res?.error) setErr("Falha ao entrar. Verifique dados e se email/telefone já estão verificados.");
+              else location.href = "/app";
+            }}
+          >
+            entrar
+          </button>
+
+          <div className="mt-2 grid gap-2">
+            <button
+              className="rounded-2xl border border-white/15 bg-transparent px-4 py-3 text-sm font-semibold hover:bg-white/5"
+              onClick={() => signIn("google", { callbackUrl: "/app" })}
+            >
+              continuar com Google
+            </button>
+            <button
+              className="rounded-2xl border border-white/15 bg-transparent px-4 py-3 text-sm font-semibold hover:bg-white/5"
+              onClick={() => signIn("apple", { callbackUrl: "/app" })}
+            >
+              continuar com iCloud (Apple)
+            </button>
+          </div>
+
+          <a className="mt-2 text-sm text-white/70 underline decoration-white/15" href="/cadastrar">
+            não tem conta? criar agora
+          </a>
+        </div>
+      </div>
+    </main>
+  );
+}
+""")
+
+w("src/app/(auth)/cadastrar/page.tsx", """"use client";
+
+import { useState } from "react";
+
+export default function Cadastrar() {
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [phone, setPhone] = useState("+55");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  return (
+    <main className="min-h-dvh grid place-items-center px-6 text-white">
+      <div className="w-full max-w-md rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+        <h1 className="text-2xl font-semibold">Criar perfil</h1>
+        <p className="mt-2 text-sm text-white/70">
+          Email + telefone serão verificados para ativar sua conta.
+        </p>
+
+        <div className="mt-6 grid gap-3">
+          <input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+            placeholder="username (único)"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            onBlur={async () => {
+              if (!username) return;
+              const r = await fetch("/api/username/check", { method: "POST", body: JSON.stringify({ username }) });
+              const j = await r.json();
+              if (!j.ok) setErr(j.error ?? "Username indisponível");
+              else setErr(null);
+            }}
+          />
+          <input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+            placeholder="nome (opcional)"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+            placeholder="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+          <input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+            placeholder="telefone (+55DDDNUMERO)"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+          />
+          <input className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+            placeholder="senha (mín. 8)"
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+
+          {err && <p className="text-sm text-rose-200">{err}</p>}
+          {msg && <p className="text-sm text-emerald-200">{msg}</p>}
+
+          <button
+            className="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+            disabled={loading}
+            onClick={async () => {
+              setLoading(true);
+              setErr(null);
+              setMsg(null);
+              const res = await fetch("/api/auth/register", {
+                method: "POST",
+                body: JSON.stringify({ username, email, phone, password, name })
+              });
+              const json = await res.json();
+              setLoading(false);
+              if (!json.ok) return setErr(json.error ?? "Erro ao criar conta.");
+              setMsg("Conta criada! Agora verifique email e telefone.");
+              // send to verify screen with userId
+              location.href = `/verificar?userId=${encodeURIComponent(json.userId)}`;
+            }}
+          >
+            criar conta
+          </button>
+
+          <a className="mt-2 text-sm text-white/70 underline decoration-white/15" href="/entrar">
+            já tem conta? entrar
+          </a>
+        </div>
+      </div>
+    </main>
+  );
+}
+""")
+
+# Verification page stepper
+w("src/app/(auth)/verificar/page.tsx", """"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
+
+export default function Verificar() {
+  const sp = useSearchParams();
+  const userId = sp.get("userId") ?? "";
+  const [emailCode, setEmailCode] = useState("");
+  const [phoneCode, setPhoneCode] = useState("");
+  const [devEmailCode, setDevEmailCode] = useState<string | null>(null);
+  const [devPhoneCode, setDevPhoneCode] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const ready = useMemo(() => Boolean(userId), [userId]);
+
+  useEffect(() => {
+    setErr(null);
+    setMsg(null);
+  }, [userId]);
+
+  return (
+    <main className="min-h-dvh grid place-items-center px-6 text-white">
+      <div className="w-full max-w-md rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+        <h1 className="text-2xl font-semibold">Verificação</h1>
+        <p className="mt-2 text-sm text-white/70">
+          Precisamos confirmar <b>email</b> e <b>telefone</b> para ativar sua conta.
+        </p>
+
+        {!ready && (
+          <p className="mt-6 text-sm text-rose-200">userId ausente. Volte ao cadastro.</p>
+        )}
+
+        <div className="mt-6 grid gap-4">
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Email</h2>
+              <button
+                className="rounded-xl bg-white/10 px-3 py-2 text-xs font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                onClick={async () => {
+                  setErr(null); setMsg(null);
+                  const r = await fetch("/api/verify/email/request", { method: "POST", body: JSON.stringify({ userId }) });
+                  const j = await r.json();
+                  if (!j.ok) setErr(j.error ?? "Erro ao enviar email.");
+                  else {
+                    setMsg("Código de email enviado.");
+                    if (j.devCode) setDevEmailCode(j.devCode);
+                  }
+                }}
+              >
+                enviar código
+              </button>
+            </div>
+
+            <div className="mt-3 grid gap-2">
+              <input
+                className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="código do email"
+                value={emailCode}
+                onChange={(e) => setEmailCode(e.target.value)}
+              />
+              <button
+                className="rounded-2xl border border-white/15 bg-transparent px-4 py-3 text-sm font-semibold hover:bg-white/5"
+                onClick={async () => {
+                  setErr(null); setMsg(null);
+                  const r = await fetch("/api/verify/email/confirm", { method: "POST", body: JSON.stringify({ userId, code: emailCode }) });
+                  const j = await r.json();
+                  if (!j.ok) setErr(j.error ?? "Código inválido.");
+                  else setMsg("Email verificado ✅");
+                }}
+              >
+                confirmar email
+              </button>
+
+              {devEmailCode && (
+                <p className="text-xs text-white/60">DEV: código email = {devEmailCode}</p>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Telefone</h2>
+              <button
+                className="rounded-xl bg-white/10 px-3 py-2 text-xs font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                onClick={async () => {
+                  setErr(null); setMsg(null);
+                  const r = await fetch("/api/verify/phone/request", { method: "POST", body: JSON.stringify({ userId }) });
+                  const j = await r.json();
+                  if (!j.ok) setErr(j.error ?? "Erro ao enviar SMS.");
+                  else {
+                    setMsg("Código de telefone enviado.");
+                    if (j.devCode) setDevPhoneCode(j.devCode);
+                  }
+                }}
+              >
+                enviar código
+              </button>
+            </div>
+
+            <div className="mt-3 grid gap-2">
+              <input
+                className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="código do SMS"
+                value={phoneCode}
+                onChange={(e) => setPhoneCode(e.target.value)}
+              />
+              <button
+                className="rounded-2xl border border-white/15 bg-transparent px-4 py-3 text-sm font-semibold hover:bg-white/5"
+                onClick={async () => {
+                  setErr(null); setMsg(null);
+                  const r = await fetch("/api/verify/phone/confirm", { method: "POST", body: JSON.stringify({ userId, code: phoneCode }) });
+                  const j = await r.json();
+                  if (!j.ok) setErr(j.error ?? "Código inválido.");
+                  else setMsg("Telefone verificado ✅");
+                }}
+              >
+                confirmar telefone
+              </button>
+
+              {devPhoneCode && (
+                <p className="text-xs text-white/60">DEV: código telefone = {devPhoneCode}</p>
+              )}
+            </div>
+          </div>
+
+          {err && <p className="text-sm text-rose-200">{err}</p>}
+          {msg && <p className="text-sm text-emerald-200">{msg}</p>}
+
+          <a className="text-sm text-white/70 underline decoration-white/15" href="/entrar">
+            depois de verificar, entrar
+          </a>
+        </div>
+      </div>
+    </main>
+  );
+}
+""")
+
+# Dashboard /app
+w("src/app/app/page.tsx", """import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import DashboardClient from "./ui";
+
+export default async function AppDashboard() {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) {
+    return (
+      <main className="min-h-dvh grid place-items-center text-white">
+        <a className="underline decoration-white/15" href="/entrar">Você precisa entrar.</a>
+      </main>
+    );
+  }
+
+  const user = await db.user.findUnique({
+    where: { email: session.user.email.toLowerCase() },
+    include: { gifts: { orderBy: { createdAt: "desc" } } }
+  });
+
+  if (!user) {
+    return (
+      <main className="min-h-dvh grid place-items-center text-white">
+        <p>Usuário não encontrado.</p>
+      </main>
+    );
+  }
+
+  return <DashboardClient user={user} />;
+}
+""")
+
+w("src/app/app/ui.tsx", """"use client";
+
+import { useMemo, useState } from "react";
+
+function toCents(brl: string) {
+  const cleaned = brl.replace(/[^0-9,\\.]/g, "").replace(".", "").replace(",", ".");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? Math.round(n * 100) : 0;
+}
+
+export default function DashboardClient({ user }: { user: any }) {
+  const publicUrl = useMemo(() => `/u/${user.username}`, [user.username]);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [savingPix, setSavingPix] = useState(false);
+
+  const [name, setName] = useState(user.name ?? "");
+  const [bio, setBio] = useState(user.bio ?? "");
+  const [avatarUrl, setAvatarUrl] = useState(user.avatarUrl ?? "");
+  const [coverUrl, setCoverUrl] = useState(user.coverUrl ?? "");
+
+  const [pixKey, setPixKey] = useState("");
+  const [pixKeyType, setPixKeyType] = useState<"PHONE"|"CPF"|"CNPJ"|"EMAIL"|"RANDOM">("EMAIL");
+
+  // Gift form
+  const [title, setTitle] = useState("");
+  const [priceBRL, setPriceBRL] = useState("");
+  const [description, setDescription] = useState("");
+  const [url, setUrl] = useState("");
+  const [imageUrl, setImageUrl] = useState("");
+
+  const [autoUrl, setAutoUrl] = useState("");
+  const [autoMsg, setAutoMsg] = useState<string | null>(null);
+
+  return (
+    <main className="min-h-dvh bg-[radial-gradient(900px_circle_at_50%_-10%,rgba(170,90,255,0.25),transparent_55%)] text-white">
+      <div className="mx-auto max-w-5xl px-6 py-10">
+        <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+          <div>
+            <h1 className="text-2xl font-semibold">Seu Genie Box</h1>
+            <p className="mt-1 text-sm text-white/70">Seu link público: <a className="underline decoration-white/15" href={publicUrl}>{publicUrl}</a></p>
+          </div>
+          <a className="text-sm text-white/70 underline decoration-white/15" href="/api/auth/signout">sair</a>
+        </div>
+
+        <div className="mt-8 grid gap-6 md:grid-cols-2">
+          <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h2 className="text-lg font-semibold">Perfil</h2>
+            <div className="mt-4 grid gap-3">
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="nome"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+              />
+              <textarea className="h-24 resize-none rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="bio"
+                value={bio}
+                onChange={(e) => setBio(e.target.value)}
+              />
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="avatarUrl (cole um link)"
+                value={avatarUrl}
+                onChange={(e) => setAvatarUrl(e.target.value)}
+              />
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="coverUrl (cole um link)"
+                value={coverUrl}
+                onChange={(e) => setCoverUrl(e.target.value)}
+              />
+
+              <button
+                className="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                disabled={savingProfile}
+                onClick={async () => {
+                  setSavingProfile(true);
+                  await fetch("/api/user/profile", { method: "POST", body: JSON.stringify({ name, bio, avatarUrl, coverUrl }) });
+                  setSavingProfile(false);
+                }}
+              >
+                salvar perfil
+              </button>
+            </div>
+          </section>
+
+          <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h2 className="text-lg font-semibold">Pix (obrigatório)</h2>
+            <p className="mt-2 text-sm text-white/70">Sua chave Pix fica criptografada no servidor.</p>
+
+            <div className="mt-4 grid gap-3">
+              <select
+                className="rounded-2xl border border-white/10 bg-[#0b0417] px-4 py-3 text-sm outline-none"
+                value={pixKeyType}
+                onChange={(e) => setPixKeyType(e.target.value as any)}
+              >
+                <option value="PHONE">telefone</option>
+                <option value="CPF">CPF</option>
+                <option value="CNPJ">CNPJ</option>
+                <option value="EMAIL">e-mail</option>
+                <option value="RANDOM">chave aleatória</option>
+              </select>
+
+              <input
+                className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none"
+                placeholder="cole sua chave Pix"
+                value={pixKey}
+                onChange={(e) => setPixKey(e.target.value)}
+              />
+
+              <button
+                className="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                disabled={savingPix}
+                onClick={async () => {
+                  setSavingPix(true);
+                  const r = await fetch("/api/user/pix", { method: "POST", body: JSON.stringify({ pixKey, pixKeyType }) });
+                  await r.json();
+                  setSavingPix(false);
+                }}
+              >
+                salvar Pix
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <div className="mt-6 grid gap-6 md:grid-cols-2">
+          <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h2 className="text-lg font-semibold">Criar presente (manual)</h2>
+            <div className="mt-4 grid gap-3">
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="nome do presente" value={title} onChange={(e) => setTitle(e.target.value)} />
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="preço (ex: 199,90)" value={priceBRL} onChange={(e) => setPriceBRL(e.target.value)} />
+              <textarea className="h-24 resize-none rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="descrição (opcional)" value={description} onChange={(e) => setDescription(e.target.value)} />
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="url do produto (opcional)" value={url} onChange={(e) => setUrl(e.target.value)} />
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="imagem (url)" value={imageUrl} onChange={(e) => setImageUrl(e.target.value)} />
+              <button
+                className="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                onClick={async () => {
+                  await fetch("/api/gifts/create", {
+                    method: "POST",
+                    body: JSON.stringify({
+                      title,
+                      priceCents: toCents(priceBRL),
+                      description: description || undefined,
+                      url: url || undefined,
+                      imageUrl: imageUrl || undefined
+                    })
+                  });
+                  location.reload();
+                }}
+              >
+                adicionar à lista
+              </button>
+            </div>
+          </section>
+
+          <section className="rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+            <h2 className="text-lg font-semibold">Adicionar por link (OG + “AI”)</h2>
+            <p className="mt-2 text-sm text-white/70">Cole um link e nós sugerimos título/descrição/imagem (você edita e confirma).</p>
+            <div className="mt-4 grid gap-3">
+              <input className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm outline-none" placeholder="cole o link do produto" value={autoUrl} onChange={(e) => setAutoUrl(e.target.value)} />
+              <button
+                className="rounded-2xl border border-white/15 bg-transparent px-4 py-3 text-sm font-semibold hover:bg-white/5"
+                onClick={async () => {
+                  setAutoMsg(null);
+                  const r = await fetch("/api/og", { method: "POST", body: JSON.stringify({ url: autoUrl }) });
+                  const j = await r.json();
+                  if (!j.ok) return setAutoMsg(j.error ?? "Falha ao ler link.");
+                  const s = await fetch("/api/gifts/suggest", { method: "POST", body: JSON.stringify({ url: autoUrl, og: j.og }) });
+                  const sj = await s.json();
+                  if (!sj.ok) return setAutoMsg(sj.error ?? "Falha ao sugerir.");
+                  setTitle(sj.suggestion.title ?? "");
+                  setDescription(sj.suggestion.description ?? "");
+                  setImageUrl(sj.suggestion.imageUrl ?? "");
+                  setUrl(autoUrl);
+                  setAutoMsg("Sugestão aplicada no formulário manual. Ajuste preço e confirme.");
+                }}
+              >
+                gerar sugestão
+              </button>
+              {autoMsg && <p className="text-sm text-emerald-200">{autoMsg}</p>}
+            </div>
+          </section>
+        </div>
+
+        <section className="mt-6 rounded-3xl border border-white/10 bg-white/5 p-6 backdrop-blur">
+          <h2 className="text-lg font-semibold">Seus presentes</h2>
+          <div className="mt-4 grid gap-3">
+            {user.gifts.map((g: any) => {
+              const brl = (g.priceCents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+              return (
+                <div key={g.id} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="font-semibold">{g.title}</h3>
+                        <span className="text-xs text-white/60">{brl}</span>
+                        <span className="text-xs text-white/50">• {g.status.toLowerCase()}</span>
+                      </div>
+                      {g.url ? <a className="text-sm text-white/70 underline decoration-white/15" href={g.url} target="_blank">link</a> : null}
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        className="rounded-xl border border-white/15 bg-transparent px-3 py-2 text-xs font-semibold hover:bg-white/5"
+                        onClick={async () => {
+                          await fetch("/api/gifts/toggle", { method: "POST", body: JSON.stringify({ giftId: g.id }) });
+                          location.reload();
+                        }}
+                      >
+                        {g.status === "HIDDEN" ? "mostrar" : "ocultar"}
+                      </button>
+                      <button
+                        className="rounded-xl bg-white/10 px-3 py-2 text-xs font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                        onClick={async () => {
+                          await fetch("/api/gifts/delete", { method: "POST", body: JSON.stringify({ giftId: g.id }) });
+                          location.reload();
+                        }}
+                      >
+                        remover
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+}
+""")
+
+# Lib files (auth, db, crypto, rateLimit, pix, validators, og, ai)
+w("src/lib/db.ts", """import { PrismaClient } from "@prisma/client";
+
+declare global {
+  // eslint-disable-next-line no-var
+  var prisma: PrismaClient | undefined;
+}
+
+export const db =
+  global.prisma ??
+  new PrismaClient({
+    log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"]
+  });
+
+if (process.env.NODE_ENV !== "production") global.prisma = db;
+""")
+
+w("src/lib/crypto.ts", """import crypto from "crypto";
+import argon2 from "argon2";
+
+const ENC_ALG = "aes-256-gcm";
+
+function getKey(): Buffer {
+  const raw = process.env.ENCRYPTION_KEY;
+  if (!raw || raw.length < 32) throw new Error("ENCRYPTION_KEY missing/too short");
+  const buf = /^[A-Za-z0-9+/=]+$/.test(raw) ? Buffer.from(raw, "base64") : Buffer.from(raw, "utf8");
+  return crypto.createHash("sha256").update(buf).digest();
+}
+
+export async function hashPassword(password: string) {
+  return argon2.hash(password, { type: argon2.argon2id });
+}
+
+export async function verifyPassword(hash: string, password: string) {
+  return argon2.verify(hash, password);
+}
+
+export function encryptString(plain: string): string {
+  const iv = crypto.randomBytes(12);
+  const key = getKey();
+  const cipher = crypto.createCipheriv(ENC_ALG, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ciphertext]).toString("base64");
+}
+
+export function decryptString(enc: string): string {
+  const data = Buffer.from(enc, "base64");
+  const iv = data.subarray(0, 12);
+  const tag = data.subarray(12, 28);
+  const ciphertext = data.subarray(28);
+  const key = getKey();
+  const decipher = crypto.createDecipheriv(ENC_ALG, key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return plain.toString("utf8");
+}
+
+export function hashCode(code: string) {
+  return crypto.createHash("sha256").update(code).digest("hex");
+}
+
+export function randomNumericCode(len = 6) {
+  let out = "";
+  for (let i = 0; i < len; i++) out += Math.floor(Math.random() * 10).toString();
+  return out;
+}
+""")
+
+w("src/lib/rateLimit.ts", """const buckets = new Map<string, { count: number; resetAt: number }>();
+
+export function rateLimit(key: string, limit = 10, windowMs = 60_000) {
+  const now = Date.now();
+  const b = buckets.get(key);
+  if (!b || now > b.resetAt) {
+    buckets.set(key, { count: 1, resetAt: now + windowMs });
+    return { ok: true as const };
+  }
+  b.count++;
+  if (b.count > limit) return { ok: false as const, retryInMs: b.resetAt - now };
+  return { ok: true as const };
+}
+""")
+
+w("src/lib/pix.ts", """import crypto from "crypto";
+
+function pad2(n: number) { return n.toString().padStart(2, "0"); }
+function emv(id: string, value: string) { return `${id}${pad2(value.length)}${value}`; }
+
+// CRC-16/CCITT-FALSE
+function crc16(payload: string) {
+  let crc = 0xffff;
+  for (let i = 0; i < payload.length; i++) {
+    crc ^= payload.charCodeAt(i) << 8;
+    for (let j = 0; j < 8; j++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, "0");
+}
+
+export function newTxid() {
+  return crypto.randomBytes(12).toString("hex");
+}
+
+export function buildPixPayload(opts: {
+  chave: string;
+  valorCents: number;
+  nome: string;
+  cidade: string;
+  txid: string;
+}) {
+  const valor = (opts.valorCents / 100).toFixed(2);
+
+  const gui = emv("00", "br.gov.bcb.pix");
+  const key = emv("01", opts.chave);
+  const desc = emv("02", `GenieBox:${opts.txid}`);
+  const mai = emv("26", `${gui}${key}${desc}`);
+
+  const payloadNoCrc =
+    emv("00", "01") +
+    emv("01", "12") +
+    mai +
+    emv("52", "0000") +
+    emv("53", "986") +
+    emv("54", valor) +
+    emv("58", "BR") +
+    emv("59", opts.nome.slice(0, 25)) +
+    emv("60", opts.cidade.slice(0, 15)) +
+    emv("62", emv("05", opts.txid.slice(0, 35))) +
+    "6304";
+
+  const crc = crc16(payloadNoCrc);
+  return payloadNoCrc + crc;
+}
+""")
+
+w("src/lib/validators.ts", """import { z } from "zod";
+
+export const usernameSchema = z
+  .string()
+  .min(3)
+  .max(24)
+  .regex(/^[a-z0-9_\\.]+$/i, "Use letras, números, _ ou .");
+
+export const phoneBRSchema = z
+  .string()
+  .min(10)
+  .max(15)
+  .regex(/^\\+?55\\d{10,13}$/, "Use formato +55DDDNUMERO (ex: +5511999999999)");
+
+export const passwordSchema = z.string().min(8).max(128);
+
+export const pixKeyTypeSchema = z.enum(["PHONE", "CPF", "CNPJ", "EMAIL", "RANDOM"]);
+
+export const createUserSchema = z.object({
+  username: usernameSchema,
+  email: z.string().email(),
+  phone: phoneBRSchema,
+  password: passwordSchema,
+  name: z.string().max(60).optional()
+});
+
+export const giftSchema = z.object({
+  title: z.string().min(2).max(120),
+  description: z.string().max(600).optional(),
+  priceCents: z.number().int().min(100),
+  url: z.string().url().optional(),
+  imageUrl: z.string().url().optional()
+});
+
+export const pixSchema = z.object({
+  pixKey: z.string().min(3).max(120),
+  pixKeyType: pixKeyTypeSchema
+});
+""")
+
+w("src/lib/og.ts", """export async function fetchOG(url: string) {
+  const res = await fetch(url, { redirect: "follow", headers: { "user-agent": "GenieBoxBot/1.0" } });
+  const html = await res.text();
+
+  const og = (prop: string) => {
+    const re = new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["'][^>]*>`, "i");
+    return re.exec(html)?.[1];
+  };
+
+  return {
+    title: og("og:title") ?? null,
+    description: og("og:description") ?? null,
+    image: og("og:image") ?? null,
+    site: og("og:site_name") ?? null
+  };
+}
+""")
+
+w("src/lib/ai.ts", """export async function aiSuggestGift(input: {
+  url: string;
+  og: { title: string | null; description: string | null; image: string | null; site: string | null };
+}) {
+  const title = (input.og.title ?? "Presente").slice(0, 120);
+  const description = (input.og.description ?? "").slice(0, 240) || undefined;
+  return { title, description, imageUrl: input.og.image ?? undefined };
+}
+""")
+
+# Auth options
+w("src/lib/auth.ts", """import { NextAuthOptions } from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+import AppleProvider from "next-auth/providers/apple";
+import CredentialsProvider from "next-auth/providers/credentials";
+import { db } from "./db";
+import { verifyPassword } from "./crypto";
+import { z } from "zod";
+
+export const authOptions: NextAuthOptions = {
+  session: { strategy: "jwt" },
+  providers: [
+    CredentialsProvider({
+      name: "Email/Telefone",
+      credentials: {
+        login: { label: "Email ou Telefone", type: "text" },
+        password: { label: "Senha", type: "password" }
+      },
+      async authorize(creds) {
+        const parsed = z.object({
+          login: z.string().min(3),
+          password: z.string().min(8)
+        }).safeParse(creds);
+
+        if (!parsed.success) return null;
+
+        const login = parsed.data.login.trim().toLowerCase();
+        const user = await db.user.findFirst({
+          where: { OR: [{ email: login }, { phone: login }, { username: login }] }
+        });
+        if (!user || !user.passwordHash) return null;
+
+        const ok = await verifyPassword(user.passwordHash, parsed.data.password);
+        if (!ok) return null;
+
+        if (!user.emailVerifiedAt || !user.phoneVerifiedAt) return null;
+
+        return { id: user.id, name: user.name ?? user.username, email: user.email };
+      }
+    }),
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID ?? "",
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? ""
+    }),
+    AppleProvider({
+      clientId: process.env.APPLE_CLIENT_ID ?? "",
+      clientSecret: process.env.APPLE_CLIENT_SECRET ?? ""
+    })
+  ],
+  callbacks: {
+    async signIn({ user, account }) {
+      if (account?.provider !== "credentials") {
+        const email = user.email?.toLowerCase();
+        if (!email) return false;
+
+        const existing = await db.user.findUnique({ where: { email } });
+        if (!existing) {
+          await db.user.create({
+            data: {
+              email,
+              phone: `+55` + Math.floor(1e10 + Math.random() * 9e10).toString(),
+              username: `user_${Math.random().toString(16).slice(2, 10)}`,
+              emailVerifiedAt: new Date()
+            }
+          });
+        } else if (!existing.emailVerifiedAt) {
+          await db.user.update({ where: { id: existing.id }, data: { emailVerifiedAt: new Date() } });
+        }
+      }
+      return true;
+    },
+    async jwt({ token }) {
+      if (!token.email) return token;
+      const u = await db.user.findUnique({ where: { email: token.email.toLowerCase() } });
+      if (u) token.sub = u.id;
+      return token;
+    }
+  },
+  pages: { signIn: "/entrar" }
+};
+""")
+
+# API routes
+w("src/app/api/auth/[...nextauth]/route.ts", """import NextAuth from "next-auth";
+import { authOptions } from "@/lib/auth";
+
+const handler = NextAuth(authOptions);
+export { handler as GET, handler as POST };
+""")
+
+w("src/app/api/auth/register/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { createUserSchema } from "@/lib/validators";
+import { hashPassword } from "@/lib/crypto";
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const parsed = createUserSchema.safeParse(body);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: parsed.error.issues[0]?.message ?? "Dados inválidos" }, { status: 400 });
+
+  const { username, email, phone, password, name } = parsed.data;
+  const lowerEmail = email.toLowerCase();
+
+  const exists = await db.user.findFirst({ where: { OR: [{ username }, { email: lowerEmail }, { phone }] } });
+  if (exists) return NextResponse.json({ ok: false, error: "Username, email ou telefone já cadastrado." }, { status: 400 });
+
+  const passwordHash = await hashPassword(password);
+  const user = await db.user.create({
+    data: { username, email: lowerEmail, phone, passwordHash, name: name ?? null }
+  });
+
+  return NextResponse.json({ ok: true, userId: user.id });
+}
+""")
+
+w("src/app/api/username/check/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { usernameSchema } from "@/lib/validators";
+
+export async function POST(req: Request) {
+  const { username } = await req.json();
+  const parsed = usernameSchema.safeParse(username);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Username inválido." }, { status: 400 });
+
+  const exists = await db.user.findUnique({ where: { username: parsed.data } });
+  if (exists) return NextResponse.json({ ok: false, error: "Username já está em uso." }, { status: 400 });
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+# Verification routes
+w("src/app/api/verify/email/request/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode, randomNumericCode } from "@/lib/crypto";
+import { rateLimit } from "@/lib/rateLimit";
+
+export async function POST(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") ?? "local";
+  const rl = rateLimit(`email:req:${ip}`, 5, 60_000);
+  if (!rl.ok) return NextResponse.json({ ok: false, error: "Muitas tentativas. Tente novamente." }, { status: 429 });
+
+  const { userId } = await req.json();
+  if (!userId) return NextResponse.json({ ok: false, error: "userId obrigatório" }, { status: 400 });
+
+  const code = randomNumericCode(6);
+  const expiresAt = new Date(Date.now() + 10 * 60_000);
+
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  await db.verificationCode.create({
+    data: {
+      userId,
+      kind: "EMAIL",
+      channel: "EMAIL",
+      codeHash: hashCode(code),
+      expiresAt
+    }
+  });
+
+  // TODO: send email via provider (Resend/SMTP)
+  return NextResponse.json({ ok: true, devCode: process.env.NODE_ENV === "development" ? code : undefined });
+}
+""")
+
+w("src/app/api/verify/email/confirm/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode } from "@/lib/crypto";
+
+export async function POST(req: Request) {
+  const { userId, code } = await req.json();
+  if (!userId || !code) return NextResponse.json({ ok: false, error: "Dados incompletos" }, { status: 400 });
+
+  const now = new Date();
+  const rec = await db.verificationCode.findFirst({
+    where: {
+      userId,
+      kind: "EMAIL",
+      usedAt: null,
+      expiresAt: { gt: now },
+      codeHash: hashCode(code)
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (!rec) return NextResponse.json({ ok: false, error: "Código inválido/expirado" }, { status: 400 });
+
+  await db.$transaction([
+    db.verificationCode.update({ where: { id: rec.id }, data: { usedAt: now } }),
+    db.user.update({ where: { id: userId }, data: { emailVerifiedAt: now } })
+  ]);
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+w("src/app/api/verify/phone/request/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode, randomNumericCode } from "@/lib/crypto";
+import { rateLimit } from "@/lib/rateLimit";
+
+export async function POST(req: Request) {
+  const ip = req.headers.get("x-forwarded-for") ?? "local";
+  const rl = rateLimit(`sms:req:${ip}`, 5, 60_000);
+  if (!rl.ok) return NextResponse.json({ ok: false, error: "Muitas tentativas. Tente novamente." }, { status: 429 });
+
+  const { userId } = await req.json();
+  const user = userId ? await db.user.findUnique({ where: { id: userId } }) : null;
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  const code = randomNumericCode(6);
+  const expiresAt = new Date(Date.now() + 10 * 60_000);
+
+  await db.verificationCode.create({
+    data: {
+      userId,
+      kind: "PHONE",
+      channel: "SMS",
+      codeHash: hashCode(code),
+      expiresAt
+    }
+  });
+
+  // TODO: send SMS via provider
+  return NextResponse.json({ ok: true, devCode: process.env.NODE_ENV === "development" ? code : undefined });
+}
+""")
+
+w("src/app/api/verify/phone/confirm/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { hashCode } from "@/lib/crypto";
+
+export async function POST(req: Request) {
+  const { userId, code } = await req.json();
+  if (!userId || !code) return NextResponse.json({ ok: false, error: "Dados incompletos" }, { status: 400 });
+
+  const now = new Date();
+  const rec = await db.verificationCode.findFirst({
+    where: {
+      userId,
+      kind: "PHONE",
+      usedAt: null,
+      expiresAt: { gt: now },
+      codeHash: hashCode(code)
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  if (!rec) return NextResponse.json({ ok: false, error: "Código inválido/expirado" }, { status: 400 });
+
+  await db.$transaction([
+    db.verificationCode.update({ where: { id: rec.id }, data: { usedAt: now } }),
+    db.user.update({ where: { id: userId }, data: { phoneVerifiedAt: now } })
+  ]);
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+# OG + suggest
+w("src/app/api/og/route.ts", """import { NextResponse } from "next/server";
+import { fetchOG } from "@/lib/og";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const { url } = await req.json();
+  const parsed = z.string().url().safeParse(url);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "URL inválida" }, { status: 400 });
+
+  const og = await fetchOG(parsed.data);
+  return NextResponse.json({ ok: true, og });
+}
+""")
+
+w("src/app/api/gifts/suggest/route.ts", """import { NextResponse } from "next/server";
+import { aiSuggestGift } from "@/lib/ai";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const parsed = z.object({
+    url: z.string().url(),
+    og: z.object({
+      title: z.string().nullable(),
+      description: z.string().nullable(),
+      image: z.string().nullable(),
+      site: z.string().nullable()
+    })
+  }).safeParse(body);
+
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const suggestion = await aiSuggestGift({ url: parsed.data.url, og: parsed.data.og });
+  return NextResponse.json({ ok: true, suggestion });
+}
+""")
+
+# Profile update + pix update (auth required)
+w("src/app/api/user/profile/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const body = await req.json();
+  const parsed = z.object({
+    name: z.string().max(60).optional(),
+    bio: z.string().max(500).optional(),
+    avatarUrl: z.string().url().optional().or(z.literal("")),
+    coverUrl: z.string().url().optional().or(z.literal(""))
+  }).safeParse(body);
+
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const email = session.user.email.toLowerCase();
+  await db.user.update({
+    where: { email },
+    data: {
+      name: parsed.data.name ?? null,
+      bio: parsed.data.bio ?? null,
+      avatarUrl: parsed.data.avatarUrl ? parsed.data.avatarUrl : null,
+      coverUrl: parsed.data.coverUrl ? parsed.data.coverUrl : null
+    }
+  });
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+w("src/app/api/user/pix/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { pixSchema } from "@/lib/validators";
+import { encryptString } from "@/lib/crypto";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const body = await req.json();
+  const parsed = pixSchema.safeParse(body);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: parsed.error.issues[0]?.message ?? "Dados inválidos" }, { status: 400 });
+
+  const email = session.user.email.toLowerCase();
+  await db.user.update({
+    where: { email },
+    data: {
+      pixKeyEnc: encryptString(parsed.data.pixKey),
+      pixKeyType: parsed.data.pixKeyType
+    }
+  });
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+# Gifts CRUD (auth required)
+w("src/app/api/gifts/create/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { giftSchema } from "@/lib/validators";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const body = await req.json();
+  const parsed = giftSchema.safeParse(body);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: parsed.error.issues[0]?.message ?? "Dados inválidos" }, { status: 400 });
+
+  const user = await db.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  const gift = await db.gift.create({
+    data: { ...parsed.data, ownerId: user.id }
+  });
+
+  return NextResponse.json({ ok: true, giftId: gift.id });
+}
+""")
+
+w("src/app/api/gifts/delete/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const { giftId } = await req.json();
+  const parsed = z.string().min(3).safeParse(giftId);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "giftId inválido" }, { status: 400 });
+
+  const user = await db.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  await db.gift.delete({ where: { id: parsed.data, ownerId: user.id } as any });
+  return NextResponse.json({ ok: true });
+}
+""")
+
+w("src/app/api/gifts/toggle/route.ts", """import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.email) return NextResponse.json({ ok: false, error: "Não autorizado" }, { status: 401 });
+
+  const { giftId } = await req.json();
+  const parsed = z.string().min(3).safeParse(giftId);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "giftId inválido" }, { status: 400 });
+
+  const user = await db.user.findUnique({ where: { email: session.user.email.toLowerCase() } });
+  if (!user) return NextResponse.json({ ok: false, error: "Usuário não encontrado" }, { status: 404 });
+
+  const gift = await db.gift.findFirst({ where: { id: parsed.data, ownerId: user.id } });
+  if (!gift) return NextResponse.json({ ok: false, error: "Presente não encontrado" }, { status: 404 });
+
+  const next = gift.status === "HIDDEN" ? "AVAILABLE" : "HIDDEN";
+  await db.gift.update({ where: { id: gift.id }, data: { status: next as any } });
+
+  return NextResponse.json({ ok: true, status: next });
+}
+""")
+
+# Pix checkout + buy + thanks
+w("src/app/api/pix/checkout/route.ts", """import { NextResponse } from "next/server";
+import QRCode from "qrcode";
+import { db } from "@/lib/db";
+import { decryptString } from "@/lib/crypto";
+import { buildPixPayload, newTxid } from "@/lib/pix";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const body = await req.json();
+  const parsed = z.object({ giftId: z.string() }).safeParse(body);
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "giftId obrigatório" }, { status: 400 });
+
+  const gift = await db.gift.findUnique({ where: { id: parsed.data.giftId }, include: { owner: true } });
+  if (!gift || gift.status !== "AVAILABLE") {
+    return NextResponse.json({ ok: false, error: "Presente indisponível" }, { status: 400 });
+  }
+
+  const owner = gift.owner;
+  if (!owner.pixKeyEnc) return NextResponse.json({ ok: false, error: "Este perfil não configurou Pix" }, { status: 400 });
+
+  const chave = decryptString(owner.pixKeyEnc);
+  const txid = newTxid();
+
+  const payload = buildPixPayload({
+    chave,
+    valorCents: gift.priceCents,
+    nome: "GENIE BOX",
+    cidade: "BRASIL",
+    txid
+  });
+
+  const purchase = await db.purchase.create({
+    data: {
+      giftId: gift.id,
+      amountCents: gift.priceCents,
+      txid,
+      pixPayload: payload
+    }
+  });
+
+  const qrDataUrl = await QRCode.toDataURL(payload, { margin: 1, scale: 8 });
+
+  return NextResponse.json({
+    ok: true,
+    purchaseId: purchase.id,
+    txid,
+    payload,
+    qrDataUrl
+  });
+}
+""")
+
+w("src/app/api/gifts/buy/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const parsed = z.object({ purchaseId: z.string(), buyerId: z.string().optional() }).safeParse(await req.json());
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const purchase = await db.purchase.findUnique({ where: { id: parsed.data.purchaseId }, include: { gift: true } });
+  if (!purchase || purchase.status !== "PENDING") return NextResponse.json({ ok: false, error: "Compra inválida" }, { status: 400 });
+
+  const now = new Date();
+
+  await db.$transaction([
+    db.purchase.update({
+      where: { id: purchase.id },
+      data: { status: "PAID", paidAt: now, buyerId: parsed.data.buyerId ?? null }
+    }),
+    db.gift.update({
+      where: { id: purchase.giftId },
+      data: { status: "BOUGHT", boughtAt: now, boughtById: parsed.data.buyerId ?? null }
+    })
+  ]);
+
+  return NextResponse.json({ ok: true });
+}
+""")
+
+w("src/app/api/thanks/send/route.ts", """import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { z } from "zod";
+
+export async function POST(req: Request) {
+  const parsed = z.object({
+    purchaseId: z.string(),
+    receiverId: z.string(),
+    message: z.string().min(2).max(800)
+  }).safeParse(await req.json());
+
+  if (!parsed.success) return NextResponse.json({ ok: false, error: "Dados inválidos" }, { status: 400 });
+
+  const purchase = await db.purchase.findUnique({
+    where: { id: parsed.data.purchaseId },
+    include: { gift: true }
+  });
+  if (!purchase || purchase.status !== "PAID") return NextResponse.json({ ok: false, error: "Compra não paga" }, { status: 400 });
+
+  const thanks = await db.thankYou.create({
+    data: {
+      purchaseId: purchase.id,
+      buyerId: purchase.buyerId,
+      receiverId: parsed.data.receiverId,
+      message: parsed.data.message
+    }
+  });
+
+  return NextResponse.json({ ok: true, thanksId: thanks.id });
+}
+""")
+
+# next-env.d.ts
+w("next-env.d.ts", """/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+
+// NOTE: This file should not be edited
+""")
+
+# Zip it
+zip_path = "/mnt/data/genie-box.zip"
+if os.path.exists(zip_path):
+    os.remove(zip_path)
+
+with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for root, dirs, files in os.walk(base):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            arc = os.path.relpath(fp, base)
+            zf.write(fp, arc)
+
+zip_path
+
