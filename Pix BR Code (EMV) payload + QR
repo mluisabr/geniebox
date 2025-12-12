@@ -1,0 +1,62 @@
+// src/lib/pix.ts
+import crypto from "crypto";
+
+function pad2(n: number) { return n.toString().padStart(2, "0"); }
+
+function emv(id: string, value: string) {
+  return `${id}${pad2(value.length)}${value}`;
+}
+
+function crc16(payload: string) {
+  // CRC-16/CCITT-FALSE
+  let crc = 0xffff;
+  for (let i = 0; i < payload.length; i++) {
+    crc ^= payload.charCodeAt(i) << 8;
+    for (let j = 0; j < 8; j++) {
+      crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+      crc &= 0xffff;
+    }
+  }
+  return crc.toString(16).toUpperCase().padStart(4, "0");
+}
+
+export function newTxid() {
+  return crypto.randomBytes(12).toString("hex"); // 24 chars
+}
+
+/**
+ * Pix "copia e cola" (EMV) payload
+ * - chave: Pix key (email/phone/CPF/CNPJ/random)
+ * - nome/cidade: appear in receiver details
+ */
+export function buildPixPayload(opts: {
+  chave: string;
+  valorCents: number;
+  nome: string;   // <= 25 recommended
+  cidade: string; // <= 15 recommended
+  txid: string;   // <= 35
+}) {
+  const valor = (opts.valorCents / 100).toFixed(2);
+
+  // Merchant Account Information (GUI + chave + description/txid)
+  const gui = emv("00", "br.gov.bcb.pix");
+  const key = emv("01", opts.chave);
+  const desc = emv("02", `GenieBox:${opts.txid}`); // optional
+  const mai = emv("26", `${gui}${key}${desc}`);
+
+  const payloadNoCrc =
+    emv("00", "01") +                 // Payload Format Indicator
+    emv("01", "12") +                 // Point of Initiation Method (12 = dynamic-ish)
+    mai +
+    emv("52", "0000") +               // Merchant Category Code
+    emv("53", "986") +                // BRL
+    emv("54", valor) +                // Amount
+    emv("58", "BR") +
+    emv("59", opts.nome.slice(0, 25)) +
+    emv("60", opts.cidade.slice(0, 15)) +
+    emv("62", emv("05", opts.txid.slice(0, 35))) + // Additional Data Field Template (txid)
+    "6304";                            // CRC placeholder
+
+  const crc = crc16(payloadNoCrc);
+  return payloadNoCrc + crc;
+}
