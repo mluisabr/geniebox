@@ -1,0 +1,145 @@
+// src/app/u/[username]/page.tsx
+import { db } from "@/lib/db";
+import GiftCard from "@/components/GiftCard";
+
+export default async function PublicProfile({ params }: { params: { username: string } }) {
+  const user = await db.user.findUnique({
+    where: { username: params.username },
+    include: { gifts: { where: { status: { in: ["AVAILABLE", "BOUGHT"] } }, orderBy: { createdAt: "desc" } } }
+  });
+
+  if (!user) return <div className="p-10 text-white/80">Perfil não encontrado.</div>;
+
+  return (
+    <main className="min-h-dvh bg-[radial-gradient(800px_circle_at_50%_-10%,rgba(170,90,255,0.25),transparent_55%)] text-white">
+      <header className="mx-auto max-w-4xl px-6 pt-10">
+        <div className="relative overflow-hidden rounded-3xl border border-white/10 bg-white/5">
+          <div className="h-40 w-full bg-[linear-gradient(135deg,rgba(200,140,255,0.16),rgba(255,255,255,0.02))]" />
+          <div className="-mt-10 flex items-end gap-4 px-6 pb-6">
+            <div className="h-20 w-20 rounded-2xl bg-white/10 ring-1 ring-white/15" />
+            <div className="pb-1">
+              <h1 className="text-2xl font-semibold">@{user.username}</h1>
+              {user.bio && <p className="mt-1 text-sm text-white/70">{user.bio}</p>}
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section className="mx-auto max-w-4xl px-6 py-10">
+        <h2 className="text-lg font-semibold">Lista de desejos</h2>
+        <div className="mt-5 grid gap-4 md:grid-cols-2">
+          {user.gifts.map((g) => (
+            <GiftCard key={g.id} gift={g} />
+          ))}
+        </div>
+      </section>
+    </main>
+  );
+}
+// src/components/GiftCard.tsx
+import PixCheckoutModal from "./PixCheckoutModal";
+
+export default function GiftCard({ gift }: { gift: any }) {
+  const brl = (gift.priceCents / 100).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+  return (
+    <div className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="text-base font-semibold">{gift.title}</h3>
+          <p className="mt-1 text-sm text-white/70">{brl}</p>
+        </div>
+
+        {gift.status === "BOUGHT" ? (
+          <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white/70 ring-1 ring-white/10">
+            comprado
+          </span>
+        ) : (
+          <PixCheckoutModal giftId={gift.id} />
+        )}
+      </div>
+
+      {gift.description && <p className="mt-3 text-sm text-white/70">{gift.description}</p>}
+      {gift.url && (
+        <a className="mt-3 inline-block text-sm text-white/80 underline decoration-white/20" href={gift.url} target="_blank">
+          ver link
+        </a>
+      )}
+    </div>
+  );
+}
+// src/components/PixCheckoutModal.tsx
+"use client";
+
+import { useState } from "react";
+
+export default function PixCheckoutModal({ giftId }: { giftId: string }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState<any>(null);
+
+  async function start() {
+    setLoading(true);
+    const res = await fetch("/api/pix/checkout", { method: "POST", body: JSON.stringify({ giftId }) });
+    const json = await res.json();
+    setData(json.ok ? json : null);
+    setLoading(false);
+  }
+
+  return (
+    <>
+      <button
+        className="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+        onClick={() => {
+          setOpen(true);
+          start();
+        }}
+      >
+        presentear
+      </button>
+
+      {open && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-6">
+          <div className="w-full max-w-lg rounded-3xl border border-white/10 bg-[#0b0417] p-6 text-white shadow-[0_30px_100px_rgba(0,0,0,0.6)]">
+            <div className="flex items-center justify-between">
+              <h4 className="text-lg font-semibold">Pagar com Pix</h4>
+              <button className="text-white/70 hover:text-white" onClick={() => setOpen(false)}>✕</button>
+            </div>
+
+            {loading && <p className="mt-4 text-sm text-white/70">Gerando QR…</p>}
+
+            {data && (
+              <div className="mt-5 grid gap-4">
+                <img src={data.qrDataUrl} alt="QR Pix" className="mx-auto w-56 rounded-2xl bg-white p-2" />
+                <textarea
+                  className="h-28 w-full resize-none rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-white/80"
+                  value={data.payload}
+                  readOnly
+                />
+                <button
+                  className="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold ring-1 ring-white/15 hover:bg-white/15"
+                  onClick={async () => {
+                    await navigator.clipboard.writeText(data.payload);
+                  }}
+                >
+                  copiar Pix
+                </button>
+
+                {/* MVP manual confirm */}
+                <button
+                  className="rounded-2xl border border-white/15 bg-transparent px-4 py-2 text-sm font-semibold text-white/90 hover:bg-white/5"
+                  onClick={async () => {
+                    await fetch("/api/gifts/buy", { method: "POST", body: JSON.stringify({ purchaseId: data.purchaseId }) });
+                    location.reload();
+                  }}
+                >
+                  já paguei (confirmar)
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
